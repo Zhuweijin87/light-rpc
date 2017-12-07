@@ -1,13 +1,15 @@
-package main
+package rpc
 
 import (
 	"encoding/gob"
 	"bytes"
 	"strings"
+	"fmt"
 	"time"
 	"sync"
+	"log"
 	"reflect"
-	"math/rand"
+	_ "math/rand"
 )
 
 type reqData struct {
@@ -15,55 +17,78 @@ type reqData struct {
 	servInf 	string  		// rpc接口
 	argsType 	reflect.Type  	// 参数类型
 	args 		[]byte 			// 传入参数
-	replyCh 	chan replyData
+	replyCh 	chan replyBuf
 }
 
-type replyData struct {
+type replyBuf struct {
 	result 		bool
 	reply 		[]byte
 } 
-
-type ClientEnd struct {
-	endNode 	interface{}
-	reqCh 		chan reqData
-}
-
-// servInf:
-// args:
-// reply:
-func (e *ClientEnd) Call(servInf string, args interface{}, reply interface{}) bool {
-	req := reqData {
-		endNode: e.endNode,
-		servInf: servInf,
-		argsType: reflect.TypeOf(args),
-		replyCh: make(chan replyData),
-	}
-
-	buffer := new(bytes.Buffer)
-	gobBuffer := gob.NewEncoder(buffer)
-	gobBuffer.Encode(args)
-	return true 
-}
 
 type Network struct {
 	mux 			sync.Mutex
 	reliable		bool 		// 是否
 	ends 			map[interface{}]*ClientEnd  // 存放客户端
-	servers 		map[interface{}]*Server  // 存放服务
+	Servers 		map[interface{}]*Server  // 存放服务
 	connections 	map[interface{}]interface{} // 连接信息
 	enables 		map[interface{}]bool 
+	reqCh 		    chan reqData
 }
 
 func NewNetwork() *Network {
 	net := &Network{
 		reliable: true,
 		ends: map[interface{}]*ClientEnd{},
-		servers: map[interface{}]*Server{},
+		Servers: map[interface{}]*Server{},
 		connections: map[interface{}](interface{}){},
-		enables: map[interface{}]bool{},
+		enables: map[interface{}]bool{},  // 服务是否生效
+		reqCh: make(chan reqData),
 	}
 
+	// 处理消息调用
+	go func() {
+		for req := range net.reqCh {
+			go net.RequestProcess(req)
+		}
+	}()
+
 	return net
+}
+
+func (nw *Network) NewClientEnd(name interface{}) *ClientEnd {
+	nw.mux.Lock()
+	defer nw.mux.Unlock()
+
+	if _, ok := nw.ends[name]; ok {
+		log.Fatalf("clientEnd:%v does exist\n", name)
+	}
+
+	client := &ClientEnd{
+		endNode: name,
+		reqCh: nw.reqCh,
+	}
+
+	nw.ends[name] = client 
+	nw.enables[name] = false 
+	nw.connections[name] = nil
+
+	return client 
+}
+
+// 添加服务
+func (nw *Network) AddServer(servName interface{}, serv *Server) {
+	nw.mux.Lock()
+	defer nw.mux.Unlock()
+
+	nw.Servers[servName] = serv
+}
+
+// 删除服务
+func (nw *Network) DelServer(servName interface{}) {
+	nw.mux.Lock()
+	defer nw.mux.Unlock()
+
+	nw.Servers[servName] = nil
 }
 
 func (nw *Network) Reliable(reliable bool) {
@@ -73,30 +98,21 @@ func (nw *Network) Reliable(reliable bool) {
 	nw.reliable = reliable
 }
 
-func (nw *Network) IsServerDead(nodeName interface{}, servName interface{}, server *Server) bool {
+func (nw *Network) Enable(servName string, enable bool) {
 	nw.mux.Lock()
 	defer nw.mux.Unlock()
 
-	if nw.enables[nodeName] == false || nw.servers[servName] != server {
+	nw.enables[servName] = enable 
+}
+
+func (nw *Network) IsServerDead(nodeName interface{}, servName interface{}, Server *Server) bool {
+	nw.mux.Lock()
+	defer nw.mux.Unlock()
+
+	if nw.enables[nodeName] == false || nw.Servers[servName] != Server {
 		return true 
 	}
 	return false
-}
-
-// 添加服务
-func (nw *Network) AddServer(servName interface{}, serv *Server) {
-	nw.mux.Lock()
-	defer nw.mux.Unlock()
-
-	nw.servers[servName] = serv
-}
-
-// 删除服务
-func (nw *Network) DelServer(servName interface{}) {
-	nw.mux.Lock()
-	defer nw.mux.Unlock()
-
-	nw.servers[servName] = nil
 }
 
 func (nw *Network) Connect(endNode interface{}, servName interface{}) {
@@ -109,33 +125,37 @@ func (nw *Network) Connect(endNode interface{}, servName interface{}) {
 func (nw *Network) RequestProcess(req reqData) {
 	enable := nw.enables[req.endNode]
 	servName := nw.connections[req.endNode]
-	reliable := nw.reliable
+	// reliable := nw.reliable
 
 	if enable && servName != nil  {
-		server := nw.servers[servName]
-		if server == nil {
+		fmt.Println("begin process request")
+		Server := nw.Servers[servName]
+		if Server == nil {
 			return 
 		}
 
-		if reliable == false {
-			ms := rand.Int() % 27
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-		}
-
-		if reliable == false && (rand.Int()%1000) < 100 {
-			// 丢弃请求数据 
-			req.replyCh <- replyData{false, nil}
-			return 
-		}
-
-		echo := make(chan replyData)
+		echo := make(chan replyBuf)
 		go func() {
-			reply := server.dispatch(req)
+			reply := Server.dispatch(req)
 			echo <- reply
 		}()
 
-		//var reply replyData
-
+		var rep replyBuf
+		ServerStatus := false 
+		replyStatus := false 
+		for ServerStatus == false && replyStatus == false {
+			select {
+			case rep = <- echo:
+				replyStatus = true 
+			case <-time.After(100 * time.Millisecond):
+				ServerStatus = nw.IsServerDead(req.endNode, servName, Server)
+			}
+		}
+		// fmt.Println("reply :", rep)
+		req.replyCh <- rep 
+	} else {
+		log.Printf("Server node %s not enable\n", req.endNode)
+		req.replyCh <- replyBuf{false, nil}
 	}
 }
 
@@ -159,7 +179,7 @@ func (srv *Server) AddService(svc *Service) {
 	srv.services[svc.name] = svc
 }
 
-func (srv *Server) dispatch(req reqData) replyData {
+func (srv *Server) dispatch(req reqData) replyBuf {
 	srv.mux.Lock()
 	srv.count += 1
 	dot := strings.LastIndex(req.servInf, ".")
@@ -173,7 +193,7 @@ func (srv *Server) dispatch(req reqData) replyData {
 		// 执行service方法
 		return service.dispatch(methodName, req)
 	} else {
-		return replyData{false, nil}
+		return replyBuf{false, nil}
 	}
 }
 
@@ -206,7 +226,7 @@ func NewService(inf interface{}) *Service {
 	return &service
 }
 
-func (svc *Service) dispatch(methodName string, req reqData) replyData {
+func (svc *Service) dispatch(methodName string, req reqData) replyBuf {
 	if method, ok := svc.methods[methodName]; ok {
 		args := reflect.New(req.argsType)
 		argsBuf := bytes.NewBuffer(req.args)
@@ -226,8 +246,45 @@ func (svc *Service) dispatch(methodName string, req reqData) replyData {
 		re := gob.NewEncoder(rb)
 		re.EncodeValue(replyVal)
 
-		return replyData{true, rb.Bytes()}
+		return replyBuf{true, rb.Bytes()}
 	} else {
-		return replyData{false, nil}
+		return replyBuf{false, nil}
 	}
 }
+
+type ClientEnd struct {
+	endNode 	interface{}
+	reqCh 		chan reqData
+}
+
+func (end *ClientEnd) Call(servInf string, args interface{}, reply interface{}) bool {
+	req := reqData {
+		endNode: end.endNode,
+		servInf: servInf,
+		argsType: reflect.TypeOf(args),
+		replyCh: make(chan replyBuf),
+	}
+
+	// 将args编码转化为bytes
+	var buffer bytes.Buffer
+	encBuf := gob.NewEncoder(&buffer)
+	encBuf.Encode(args)
+	req.args = buffer.Bytes()
+
+	end.reqCh <- req  
+	rep := <-req.replyCh
+	if rep.result {
+		// 将返回参数解码 
+		replyBuf := bytes.NewBuffer(rep.reply)
+		decBuf := gob.NewDecoder(replyBuf)
+		if err := decBuf.Decode(reply); err != nil {
+			log.Fatalf("Client call fail: decode reply: %v\n", err)
+		}
+
+		return true 
+	} else {
+		return false
+	}
+	
+}
+
